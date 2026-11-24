@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>x86-64 物理地址空间、字段划分与主机桥路由仿真</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap');
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at 20% 0%, #0f1b33 0%, #050814 55%, #03050c 100%);
+      color: #e2e8f0;
+    }
+    .font-mono {
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .glass-panel {
+      background: rgba(11, 18, 34, 0.84);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(56, 189, 248, 0.16);
+      box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.6), 0 14px 36px -12px rgba(0, 0, 0, 0.7);
+    }
+    .zone-btn {
+      background: rgba(15, 23, 42, 0.72);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      transition: all 0.18s ease;
+    }
+    .zone-btn:hover {
+      border-color: rgba(56, 189, 248, 0.55);
+      background: rgba(15, 29, 56, 0.9);
+      transform: translateY(-1px);
+    }
+    .zone-btn.is-active {
+      border-color: var(--glow, #38bdf8);
+      box-shadow: 0 0 18px -4px var(--glow, #38bdf8);
+      background: rgba(15, 29, 56, 0.95);
+    }
+  </style>
+</head>
+<body class="min-h-screen antialiased">
+  <div class="max-w-6xl mx-auto px-4 py-4 space-y-3">
+    <!-- 顶部芯片级仪器标题栏（英文术语均附中文释义） -->
+    <header class="glass-panel rounded-2xl px-5 py-3.5 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+      <div class="flex items-start gap-3">
+        <div class="mt-1 w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_10px_#22d3ee] shrink-0"></div>
+        <div>
+          <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight">x86-64 物理地址空间、字段划分与主机桥路由仿真</h1>
+          <p class="text-[11px] font-mono text-cyan-300/80 mt-0.5">
+            TOM(总物理内存)=8GB (4×2GB条) · TOLUD(低端上限)=3GB · ROM(只读固件)=2MB · 字长32位/按字节编址
+          </p>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2">
+        <div class="inline-flex bg-slate-950/90 p-0.5 rounded-xl border border-slate-800" role="group" aria-label="内存回收开关">
+          <button id="btn-reclaim-on" type="button" class="px-2.5 py-1.5 text-xs font-mono font-semibold rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-400/50 transition">重映射(Reclaim): 开</button>
+          <button id="btn-reclaim-off" type="button" class="px-2.5 py-1.5 text-xs font-mono font-semibold rounded-lg text-slate-400 hover:text-white border border-transparent transition">关 (对比浪费)</button>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <input id="pa-input" type="text" value="0x210000004" aria-label="输入物理地址" class="w-32 px-2.5 py-1.5 text-xs font-mono font-bold rounded-xl border border-cyan-500/30 bg-slate-950 text-cyan-200 focus:outline-none focus:border-cyan-400">
+          <button id="btn-run" type="button" class="px-3 py-1.5 text-xs font-bold rounded-xl bg-cyan-500 text-slate-950 hover:bg-cyan-400 shadow-[0_0_14px_rgba(34,211,238,0.35)] transition">执行访存</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 5 大完整物理地址区间快捷切换 -->
+    <nav class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2" aria-label="五大物理地址区间">
+      <button id="case-low" type="button" class="zone-btn text-left rounded-xl px-3 py-2.5" style="--glow:#38bdf8">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-bold text-sky-300">0~3G 低端直通</span>
+          <span class="font-mono text-[10px] text-sky-400/90">1.50G</span>
+        </div>
+        <div class="font-mono text-[11px] text-slate-400 mt-0.5">0x0_6000_0007</div>
+      </button>
+
+      <button id="case-mmio" type="button" class="zone-btn text-left rounded-xl px-3 py-2.5" style="--glow:#a78bfa">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-bold text-violet-300">3~4G MMIO 空洞</span>
+          <span class="font-mono text-[10px] text-violet-400/90">3.25G</span>
+        </div>
+        <div class="font-mono text-[11px] text-slate-400 mt-0.5">0x0_D000_0010</div>
+      </button>
+
+      <button id="case-rom" type="button" class="zone-btn text-left rounded-xl px-3 py-2.5" style="--glow:#fbbf24">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-bold text-amber-300">4G 顶端 BIOS ROM</span>
+          <span class="font-mono text-[10px] text-amber-400/90">2 MB</span>
+        </div>
+        <div class="font-mono text-[11px] text-slate-400 mt-0.5">0x0_FFFF_FFF0</div>
+      </button>
+
+      <button id="case-high" type="button" class="zone-btn text-left rounded-xl px-3 py-2.5" style="--glow:#22d3ee">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-bold text-cyan-300">4~8G 高端直通</span>
+          <span class="font-mono text-[10px] text-cyan-400/90">5.00G</span>
+        </div>
+        <div class="font-mono text-[11px] text-slate-400 mt-0.5">0x1_4000_0008</div>
+      </button>
+
+      <button id="case-remap" type="button" class="zone-btn text-left rounded-xl px-3 py-2.5 col-span-2 sm:col-span-1" style="--glow:#34d399">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-bold text-emerald-300">8~9G 重映射回收</span>
+          <span class="font-mono text-[10px] text-emerald-400/90">8.25G</span>
+        </div>
+        <div class="font-mono text-[11px] text-slate-400 mt-0.5">0x2_1000_0004</div>
+      </button>
+    </nav>
+
+    <!-- 核心硅片级视觉舞台 -->
+    <section class="glass-panel rounded-2xl overflow-hidden">
+      <div class="border-b border-slate-800/90 px-4 py-2 flex flex-wrap items-center justify-between gap-2 bg-slate-950/60">
+        <div class="flex items-center gap-3 text-xs">
+          <span class="font-mono font-bold text-cyan-300 tracking-wide">硬件数据通路 (Datapath)：CPU → MMU(内存管理单元) → Cache(高速缓存) → 主机桥</span>
+          <span id="stage-status" class="font-mono text-[11px] px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-semibold">传输中</span>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <button id="btn-replay" type="button" class="px-2.5 py-1 text-xs font-semibold rounded-lg border border-slate-700 bg-slate-900 text-slate-200 hover:border-cyan-400 transition">重播信号</button>
+          <button id="btn-pause" type="button" class="px-2.5 py-1 text-xs font-semibold rounded-lg border border-slate-700 bg-slate-900 text-slate-200 hover:border-cyan-400 transition">暂停讲解</button>
+        </div>
+      </div>
+
+      <div class="relative w-full bg-[#060b18]" style="height: 410px;">
+        <canvas id="sim-canvas" class="w-full h-full block"></canvas>
+      </div>
+
+      <!-- 新增核心模块：物理地址字段划分实时拆解仪 -->
+      <div class="border-t border-slate-800 bg-slate-950/90 px-4 py-3 space-y-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex items-center gap-2">
+            <span class="w-1.5 h-4 rounded-full bg-cyan-400"></span>
+            <span id="field-heading" class="text-xs font-bold text-white">物理地址字段划分（按目标硬件实时拆位）</span>
+          </div>
+          <div id="interleave-toggle" class="inline-flex bg-slate-900 p-0.5 rounded-lg border border-slate-700" role="group" aria-label="RAM编址方式切换">
+            <button id="btn-il-none" type="button" class="px-2.5 py-1 text-[11px] font-semibold rounded-md text-slate-400 hover:text-white border border-transparent transition">不交叉编址</button>
+            <button id="btn-il-low" type="button" class="px-2.5 py-1 text-[11px] font-semibold rounded-md bg-cyan-500/20 text-cyan-300 border border-cyan-400/50 transition">RAM 低位交叉 (常用)</button>
+            <button id="btn-il-high" type="button" class="px-2.5 py-1 text-[11px] font-semibold rounded-md text-slate-400 hover:text-white border border-transparent transition">RAM 高位交叉</button>
+          </div>
+        </div>
+
+        <!-- 动态物理地址位段卡片 -->
+        <div id="field-strip" class="grid grid-cols-1 md:grid-cols-12 gap-2"></div>
+      </div>
+
+      <!-- 底部精密工程遥测仪（中英对照） -->
+      <div class="border-t border-slate-800 bg-slate-950/95 px-4 py-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 text-xs">
+        <div class="rounded-lg bg-slate-900/70 border border-slate-800 px-3 py-2">
+          <div class="text-[10px] font-mono font-semibold text-slate-400">01 / MMU(内存管理单元) &amp; Cache 策略</div>
+          <div id="tel-cache" class="font-mono font-bold text-cyan-200 mt-0.5">--</div>
+        </div>
+        <div class="rounded-lg bg-slate-900/70 border border-slate-800 px-3 py-2">
+          <div class="text-[10px] font-mono font-semibold text-slate-400">02 / 主机桥 (Host Bridge) 区间判决</div>
+          <div id="tel-decode" class="font-mono font-bold text-white mt-0.5">--</div>
+        </div>
+        <div class="rounded-lg bg-slate-900/70 border border-slate-800 px-3 py-2">
+          <div class="text-[10px] font-mono font-semibold text-slate-400">03 / 地址变换公式 (Offset/Remap)</div>
+          <div id="tel-formula" class="font-mono font-bold text-amber-300 mt-0.5">--</div>
+        </div>
+        <div class="rounded-lg bg-slate-900/70 border border-slate-800 px-3 py-2">
+          <div class="text-[10px] font-mono font-semibold text-slate-400">04 / 最终目标器件</div>
+          <div id="tel-target" class="font-mono font-bold text-emerald-300 mt-0.5">--</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('sim-canvas');
+    const ctx = canvas.getContext('2d');
+
+    const btnReclaimOn = document.getElementById('btn-reclaim-on');
+    const btnReclaimOff = document.getElementById('btn-reclaim-off');
+    const btnIlNone = document.getElementById('btn-il-none');
+    const btnIlLow = document.getElementById('btn-il-low');
+    const btnIlHigh = document.getElementById('btn-il-high');
+    const interleaveToggle = document.getElementById('interleave-toggle');
+    const paInput = document.getElementById('pa-input');
+    const btnRun = document.getElementById('btn-run');
+    const btnReplay = document.getElementById('btn-replay');
+    const btnPause = document.getElementById('btn-pause');
+    const stageStatus = document.getElementById('stage-status');
+
+    const fieldHeading = document.getElementById('field-heading');
+    const fieldStrip = document.getElementById('field-strip');
+    const telCache = document.getElementById('tel-cache');
+    const telDecode = document.getElementById('tel-decode');
+    const telFormula = document.getElementById('tel-formula');
+    const telTarget = document.getElementById('tel-target');
+
+    const caseBtns = {
+      low_ram: document.getElementById('case-low'),
+      mmio: document.getElementById('case-mmio'),
+      rom: document.getElementById('case-rom'),
+      high_ram: document.getElementById('case-high'),
+      remap: document.getElementById('case-remap')
+    };
+
+    const TOLUD = 0xC0000000n;      // 3GB
+    const ROM_BASE = 0xFFE00000n;   // 4GB - 2MB
+    const FOUR_GB = 0x100000000n;   // 4GB
+    const TOM = 0x200000000n;       // 8GB
+    const TOUUD = 0x240000000n;     // 9GB
+
+    const state = {
+      reclaim: true,
+      interleave: 'low', // 'low' | 'high'
+      pa: 0x210000004n,  // 默认展示 8.25G 重映射，最能体现两步变换与字段划分
+      paused: false,
+      anim: null,
+      info: null
+    };
+
+    const W = 1080, H = 410;
+
+    function fmtHex(n) {
+      const h = n.toString(16).toUpperCase().padStart(9, '0');
+      return `0x${h[0]}_${h.slice(1,5)}_${h.slice(5)}`;
+    }
+
+    function fmtGb(n) {
+      return (Number(n) / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+    }
+
+    function toBinBig(n, len) {
+      return n.toString(2).padStart(len, '0');
+    }
+
+    function analyzePA(pa, reclaim) {
+      if (pa < TOLUD) {
+        return {
+          kind: 'low_ram',
+          color: '#38bdf8',
+          mmuText: 'VA→PA·WB',
+          cache: 'MMU 译出 WB(写回) → 经 Cache 缓存',
+          bypassCache: false,
+          decode: 'PA < TOLUD(3G) → 主存放行(EN=1)',
+          formula: `DRAM = PA = ${fmtHex(pa)} (直通)`,
+          target: 'IMC(内存控制器) → DDR 0~3G',
+          dramAddr: pa,
+          imcOpen: true,
+          useSub: false,
+          dst: 'dram_low'
+        };
+      }
+      if (pa >= ROM_BASE && pa < FOUR_GB) {
+        const off = pa - ROM_BASE;
+        return {
+          kind: 'rom',
+          color: '#fbbf24',
+          mmuText: '实模式/UC',
+          cache: '复位直通 PA 或 UC(不可缓存) → 绕过 Cache',
+          bypassCache: true,
+          decode: '高11位全1 → 经 DMI(芯片组总线) 转南桥',
+          formula: `偏移 = PA - 0xFFE0_0000 = +0x${off.toString(16).toUpperCase()}`,
+          target: 'PCH(南桥) → SPI Flash BIOS ROM',
+          dramAddr: null,
+          imcOpen: false,
+          useSub: false,
+          dst: 'rom'
+        };
+      }
+      if (pa >= TOLUD && pa < ROM_BASE) {
+        const barBase = 0xD0000000n;
+        const off = pa >= barBase ? (pa - barBase) : (pa - TOLUD);
+        return {
+          kind: 'mmio',
+          color: '#a78bfa',
+          mmuText: 'VA→PA·UC',
+          cache: '必经 MMU 查表得 UC(不可缓存) → 仅绕过 Cache',
+          bypassCache: true,
+          decode: 'TOLUD ≤ PA < 4G → 关主存(EN=0)',
+          formula: `偏移 = PA - BAR(设备基址) = +0x${off.toString(16).toUpperCase()}`,
+          target: 'PCIe 根复合体 → 外设寄存器',
+          dramAddr: null,
+          imcOpen: false,
+          useSub: false,
+          dst: 'pcie'
+        };
+      }
+      if (pa >= FOUR_GB && pa < TOM) {
+        return {
+          kind: 'high_ram',
+          color: '#22d3ee',
+          mmuText: 'VA→PA·WB',
+          cache: 'MMU 译出 WB(写回) → 经 Cache 缓存',
+          bypassCache: false,
+          decode: '4G ≤ PA < 8G → 主存放行(EN=1)',
+          formula: `DRAM = PA = ${fmtHex(pa)} (1:1 直通)`,
+          target: `IMC(内存控制器) → DDR 4~8G (${fmtGb(pa)})`,
+          dramAddr: pa,
+          imcOpen: true,
+          useSub: false,
+          dst: 'dram_high'
+        };
+      }
+      if (reclaim && pa >= TOM && pa < TOUUD) {
+        const dram = (pa - TOM) + TOLUD;
+        return {
+          kind: 'remap',
+          color: '#34d399',
+          mmuText: 'VA→PA·WB',
+          cache: 'MMU 译出 WB(写回) → 经 Cache 缓存',
+          bypassCache: false,
+          decode: '命中重映射窗 [8G, 9G) → 减法器折回',
+          formula: `DRAM = (PA - 8G) + 3G = ${fmtHex(dram)}`,
+          target: `IMC → DDR 3~4G 回收区 (${fmtGb(dram)})`,
+          dramAddr: dram,
+          imcOpen: true,
+          useSub: true,
+          dst: 'dram_reclaim'
+        };
+      }
+      return {
+        kind: 'invalid',
+        color: '#f43f5e',
+        mmuText: 'VA→PA',
+        cache: '无效物理地址 (超出可用上限 TOUUD)',
+        bypassCache: true,
+        decode: '未命中有效区间 (UR 无响应)',
+        formula: '重映射已关 · 8~9G 不可寻址',
+        target: '无响应 (DRAM 3~4G 被遮蔽浪费)',
+        dramAddr: null,
+        imcOpen: false,
+        useSub: false,
+        dst: 'none'
+      };
+    }
+
+    function makeFieldCard(colSpan, borderCls, label, bitRange, valStr, subStr) {
+      const div = document.createElement('div');
+      div.className = `${colSpan} rounded-xl px-3 py-2 border bg-slate-900/80 ${borderCls} flex flex-col justify-between gap-1`;
+
+      const top = document.createElement('div');
+      top.className = 'flex items-center justify-between gap-1 text-[11px]';
+      const l = document.createElement('span');
+      l.className = 'font-bold text-slate-100';
+      l.textContent = label;
+      const r = document.createElement('span');
+      r.className = 'font-mono text-[10px] text-slate-400 shrink-0';
+      r.textContent = bitRange;
+      top.append(l, r);
+
+      const v = document.createElement('div');
+      v.className = 'font-mono text-xs font-bold text-cyan-200 bg-slate-950/90 rounded-md px-2 py-1 border border-slate-800';
+      v.textContent = valStr;
+
+      const s = document.createElement('div');
+      s.className = 'text-[10.5px] text-slate-400';
+      s.textContent = subStr;
+
+      div.append(top, v, s);
+      return div;
+    }
+
+    function renderAddressFields(info) {
+      fieldStrip.replaceChildren();
+      const isRam = info.dramAddr !== null;
+      interleaveToggle.style.display = isRam ? 'inline-flex' : 'none';
+
+      const byteOff = Number(state.pa & 3n);
+
+      if (info.kind === 'rom') {
+        fieldHeading.textContent = '物理地址字段划分：32 位 ROM 区间（高 11 位区间匹配 + 低 21 位 ROM 片内偏移）';
+        const romOff = state.pa - ROM_BASE;
+        const romWord = romOff >> 2n;
+        fieldStrip.append(
+          makeFieldCard('md:col-span-4', 'border-amber-500/50', '高位区段匹配位 (不接 ROM 引脚)', 'A31 ~ A21 (11 bit)', '111 1111 1111₂ (全1)', '主机桥正向译码，锁定 4GB 顶端 2MB ROM 窗'),
+          makeFieldCard('md:col-span-5', 'border-emerald-500/40', 'ROM 片内字地址 (不交叉)', 'A20 ~ A2 (19 bit)', `0x${romWord.toString(16).toUpperCase().padStart(5,'0')} (第 ${romWord.toString()} 字)`, '经南桥 SPI 控制器线性寻址 2MB 固件芯片'),
+          makeFieldCard('md:col-span-3', 'border-slate-600/60', '字内字节偏移 (Byte Offset)', 'A1 ~ A0 (2 bit)', `${toBinBig(BigInt(byteOff), 2)}₂ (第 ${byteOff} 字节)`, '永远在最低位，选中 32 位字内具体字节')
+        );
+        return;
+      }
+
+      if (info.kind === 'mmio') {
+        fieldHeading.textContent = '物理地址字段划分：32 位 PCIe MMIO 空洞（高位 BAR 匹配 + 低位设备寄存器偏移）';
+        const barHi = (state.pa >> 20n) & 0xFFFn;
+        const regWord = (state.pa & 0xFFFFFn) >> 2n;
+        fieldStrip.append(
+          makeFieldCard('md:col-span-4', 'border-violet-500/50', 'PCIe BAR 基址匹配位', 'A31 ~ A20 (12 bit)', `0x${barHi.toString(16).toUpperCase().padStart(3,'0')} (基址 0xD000_0000)`, '主机桥转发至 PCIe，对应外设 BAR 认领'),
+          makeFieldCard('md:col-span-5', 'border-emerald-500/40', '外设内部寄存器字偏移', 'A19 ~ A2 (18 bit)', `字偏移 +0x${regWord.toString(16).toUpperCase().padStart(5,'0')}`, 'Offset = PA - BAR_Base，定位设备内部寄存器'),
+          makeFieldCard('md:col-span-3', 'border-slate-600/60', '字内字节偏移 (字节选通 BE#)', 'A1 ~ A0 (2 bit)', `${toBinBig(BigInt(byteOff), 2)}₂ (第 ${byteOff} 字节)`, '永远在最低位，控制读写字内哪些字节')
+        );
+        return;
+      }
+
+      if (info.kind === 'invalid') {
+        fieldHeading.textContent = '物理地址字段划分：无效地址（重映射已关闭，超出可用物理上限）';
+        fieldStrip.append(
+          makeFieldCard('md:col-span-12', 'border-rose-500/60', '未命中任何有效物理硬件区间', 'PA = ' + fmtHex(state.pa), 'Master Abort / Unsupported Request (无响应)', '请开启上方「重映射(Reclaim): 开」将 8~9G 折回被遮蔽的 DRAM 3~4G')
+        );
+        return;
+      }
+
+      // 命中 RAM（低端 / 高端 / 重映射折回后）：33 位 DRAM 内部地址 (8GB)
+      const d = info.dramAddr;
+      const wordAddr = d >> 2n; // 31 位主存字地址
+      if (state.interleave === 'none') {
+        const chipSel = Number((wordAddr >> 28n) & 7n); // 高 3 位选 8 组 1GB 芯片组/Rank
+        const chipInner = wordAddr & ((1n << 28n) - 1n); // 低 28 位片内字地址
+        fieldHeading.textContent = info.kind === 'remap'
+          ? `物理地址字段划分：经重映射折算为 33 位 DRAM 地址 (${fmtHex(d)}) → 「不交叉编址」(无体号)`
+          : `物理地址字段划分：33 位 DRAM 地址 (${fmtHex(d)}) → 「不交叉编址」(片选位 + 片内地址 + 字节偏移)`;
+        fieldStrip.append(
+          makeFieldCard('md:col-span-4', 'border-sky-500/60', '片选位 (选择 DRAM 芯片组/Rank)', 'Bit 32 ~ 30 (3 bit)', `${toBinBig(BigInt(chipSel), 3)}₂ → 选中第 ${chipSel} 组芯片 (CS${chipSel}#)`, '不采用跨条交叉，直接按顺序片选芯片组'),
+          makeFieldCard('md:col-span-5', 'border-emerald-500/50', '片内地址 (选择芯片内部存储字)', 'Bit 29 ~ 2 (28 bit)', `0x${chipInner.toString(16).toUpperCase().padStart(7,'0')}`, '并联送入芯片内部地址引脚（2²⁸ 字 = 1GB/组）'),
+          makeFieldCard('md:col-span-3', 'border-slate-600/60', '字内字节偏移 (字节选通 BE#)', 'Bit 1 ~ 0 (2 bit)', `${toBinBig(BigInt(byteOff), 2)}₂ (第 ${byteOff} 字节)`, '永远在最低位，不接芯片地址端')
+        );
+        return;
+      }
+
+      const isLow = state.interleave === 'low';
+      const modId = Number(isLow ? (wordAddr & 3n) : ((wordAddr >> 29n) & 3n));
+      const innerWord = isLow ? (wordAddr >> 2n) : (wordAddr & ((1n << 29n) - 1n));
+
+      fieldHeading.textContent = info.kind === 'remap'
+        ? `物理地址字段划分：经重映射折算为 33 位 DRAM 地址 (${fmtHex(d)}) → 按「${isLow ? '低位交叉' : '高位交叉'}」拆位`
+        : `物理地址字段划分：33 位 DRAM 地址 (${fmtHex(d)}，4×2GB 内存条) → 按「${isLow ? '低位交叉' : '高位交叉'}」拆位`;
+
+      if (isLow) {
+        fieldStrip.append(
+          makeFieldCard('md:col-span-5', 'border-emerald-500/50', '体内地址 (条内片选/Rank + 片内地址)', 'Bit 32 ~ 4 (29 bit)', `0x${innerWord.toString(16).toUpperCase().padStart(8,'0')}`, '并联送入 4 根 2GB 内存条内部地址引脚'),
+          makeFieldCard('md:col-span-4', 'border-cyan-500/60', '体号 / 选条位 (不算体内字地址)', 'Bit 3 ~ 2 (2 bit)', `${toBinBig(BigInt(modId), 2)}₂ → 选中内存条 M${modId} (CS${modId}#)`, '低位交叉：连续字横向分散到 M0~M3 流水访存'),
+          makeFieldCard('md:col-span-3', 'border-slate-600/60', '字内字节偏移 (字节选通 BE#)', 'Bit 1 ~ 0 (2 bit)', `${toBinBig(BigInt(byteOff), 2)}₂ (第 ${byteOff} 字节)`, '永远在最低位，不接内存芯片地址端')
+        );
+      } else {
+        fieldStrip.append(
+          makeFieldCard('md:col-span-4', 'border-cyan-500/60', '体号 / 选条位 (不算体内字地址)', 'Bit 32 ~ 31 (2 bit)', `${toBinBig(BigInt(modId), 2)}₂ → 选中内存条 M${modId} (CS${modId}#)`, '高位交叉：每根内存条占连续 2GB 空间'),
+          makeFieldCard('md:col-span-5', 'border-emerald-500/50', '体内地址 (条内片选/Rank + 片内地址)', 'Bit 30 ~ 2 (29 bit)', `0x${innerWord.toString(16).toUpperCase().padStart(8,'0')}`, '并联送入 4 根 2GB 内存条内部地址引脚'),
+          makeFieldCard('md:col-span-3', 'border-slate-600/60', '字内字节偏移 (字节选通 BE#)', 'Bit 1 ~ 0 (2 bit)', `${toBinBig(BigInt(byteOff), 2)}₂ (第 ${byteOff} 字节)`, '永远在最低位，不接内存芯片地址端')
+        );
+      }
+    }
+
+    function buildSignalPath(info) {
+      const pts = [
+        { x: 346, y: 196 },
+        { x: 372, y: 196 },
+        { x: 452, y: 196 }
+      ];
+      if (info.bypassCache) {
+        pts.push({ x: 470, y: 196 }, { x: 470, y: 118 }, { x: 586, y: 118 }, { x: 586, y: 196 });
+      } else {
+        pts.push({ x: 488, y: 196 }, { x: 568, y: 196 });
+      }
+      pts.push({ x: 604, y: 196 });
+      if (info.dst === 'none') {
+        pts.push({ x: 688, y: 196 });
+        return pts;
+      }
+      if (info.useSub) {
+        pts.push({ x: 688, y: 196 }, { x: 688, y: 256, transform: true }, { x: 772, y: 256 });
+        pts.push({ x: 832, y: 256 }, { x: 832, y: 308 }, { x: 866, y: 308 });
+      } else if (info.dst === 'dram_low') {
+        pts.push({ x: 688, y: 196 }, { x: 772, y: 256 }, { x: 832, y: 256 }, { x: 832, y: 354 }, { x: 866, y: 354 });
+      } else if (info.dst === 'dram_high') {
+        pts.push({ x: 688, y: 196 }, { x: 772, y: 256 }, { x: 832, y: 256 }, { x: 832, y: 262 }, { x: 866, y: 262 });
+      } else if (info.dst === 'pcie') {
+        pts.push({ x: 688, y: 196 }, { x: 688, y: 146 }, { x: 772, y: 146 }, { x: 818, y: 146 }, { x: 818, y: 66 }, { x: 866, y: 66 });
+      } else if (info.dst === 'rom') {
+        pts.push({ x: 688, y: 196 }, { x: 688, y: 174 }, { x: 772, y: 174 }, { x: 832, y: 174 }, { x: 832, y: 152 }, { x: 866, y: 152 });
+      }
+      return pts;
+    }
+
+    function startTrace() {
+      const info = analyzePA(state.pa, state.reclaim);
+      state.info = info;
+      state.paused = false;
+      btnPause.textContent = '暂停讲解';
+
+      paInput.value = '0x' + state.pa.toString(16).toUpperCase();
+      telCache.textContent = info.cache;
+      telDecode.textContent = info.decode;
+      telFormula.textContent = info.formula;
+      telTarget.textContent = info.target;
+      stageStatus.textContent = '传输中 (TRACING)';
+      stageStatus.className = 'font-mono text-[11px] px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-semibold';
+
+      btnReclaimOn.className = 'px-2.5 py-1.5 text-xs font-mono font-semibold rounded-lg border transition ' + (
+        state.reclaim ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/50' : 'text-slate-400 hover:text-white border-transparent'
+      );
+      btnReclaimOff.className = 'px-2.5 py-1.5 text-xs font-mono font-semibold rounded-lg border transition ' + (
+        !state.reclaim ? 'bg-rose-500/20 text-rose-300 border-rose-400/50' : 'text-slate-400 hover:text-white border-transparent'
+      );
+      btnIlNone.className = 'px-2.5 py-1 text-[11px] font-semibold rounded-md border transition ' + (
+        state.interleave === 'none' ? 'bg-sky-500/20 text-sky-300 border-sky-400/50' : 'text-slate-400 hover:text-white border-transparent'
+      );
+      btnIlLow.className = 'px-2.5 py-1 text-[11px] font-semibold rounded-md border transition ' + (
+        state.interleave === 'low' ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400/50' : 'text-slate-400 hover:text-white border-transparent'
+      );
+      btnIlHigh.className = 'px-2.5 py-1 text-[11px] font-semibold rounded-md border transition ' + (
+        state.interleave === 'high' ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400/50' : 'text-slate-400 hover:text-white border-transparent'
+      );
+
+      Object.entries(caseBtns).forEach(([k, b]) => {
+        b.classList.toggle('is-active', k === info.kind);
+      });
+
+      renderAddressFields(info);
+
+      state.anim = {
+        pts: buildSignalPath(info),
+        seg: 0,
+        t: 0,
+        done: false,
+        transformed: false,
+        label: info.kind === 'rom' ? 'FFFF_FFF0h' : fmtGb(state.pa)
+      };
+    }
+
+    function rRect(x, y, w, h, r, fill, stroke, lw = 1.5, glow = null) {
+      ctx.save();
+      if (glow) {
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 14;
+      }
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, r);
+      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+      ctx.restore();
+    }
+
+    function linePath(pts, color, lw, dash = null, glow = null) {
+      ctx.save();
+      if (glow) {
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 10;
+      }
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lw;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      if (dash) ctx.setLineDash(dash);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawBackgroundGrid() {
+      ctx.fillStyle = '#060b18';
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.05)';
+      ctx.lineWidth = 1;
+      for (let x = 0; x < W; x += 28) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+      for (let y = 0; y < H; y += 28) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+    }
+
+    function drawLeftMemoryMap() {
+      ctx.fillStyle = 'rgba(11, 18, 36, 0.85)';
+      ctx.fillRect(0, 0, 254, H);
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.18)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(254, 0); ctx.lineTo(254, H); ctx.stroke();
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '700 11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('物理地址空间 (PA)', 76, 26);
+      ctx.fillText('真实主存 (DRAM)', 192, 26);
+
+      const y0 = 378, pxPerGb = 36;
+      const yG = g => y0 - g * pxPerGb;
+      const k = state.info ? state.info.kind : '';
+
+      rRect(26, yG(3), 98, 3 * pxPerGb, 5, k === 'low_ram' ? '#0c4a6e' : '#0f172a', '#38bdf8', k === 'low_ram' ? 2 : 1.2, k === 'low_ram' ? '#38bdf8' : null);
+      rRect(26, yG(4), 98, pxPerGb - 9, 3, k === 'mmio' ? '#3b0764' : '#1e1b4b', '#a78bfa', k === 'mmio' ? 2 : 1.2, k === 'mmio' ? '#a78bfa' : null);
+      rRect(26, yG(4), 98, 10, 2, k === 'rom' ? '#78350f' : '#451a03', '#fbbf24', k === 'rom' ? 2 : 1.2, k === 'rom' ? '#fbbf24' : null);
+      rRect(26, yG(8), 98, 4 * pxPerGb, 5, k === 'high_ram' ? '#083344' : '#0f172a', '#22d3ee', k === 'high_ram' ? 2 : 1.2, k === 'high_ram' ? '#22d3ee' : null);
+
+      if (state.reclaim) {
+        rRect(26, yG(9), 98, pxPerGb, 5, k === 'remap' ? '#064e3b' : '#052e16', '#34d399', k === 'remap' ? 2 : 1.2, k === 'remap' ? '#34d399' : null);
+      } else {
+        rRect(26, yG(9), 98, pxPerGb, 5, '#0f172a', '#334155', 1);
+      }
+
+      ctx.font = '600 10px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#7dd3fc'; ctx.fillText('0~3G RAM', 75, yG(1.5) + 4);
+      ctx.fillStyle = '#c4b5fd'; ctx.fillText('3~4G MMIO', 75, yG(3.38) + 4);
+      ctx.fillStyle = '#67e8f9'; ctx.fillText('4~8G RAM', 75, yG(6) + 4);
+      ctx.fillStyle = state.reclaim ? '#6ee7b7' : '#475569';
+      ctx.fillText(state.reclaim ? '8~9G 重映射' : '未启用', 75, yG(8.5) + 4);
+
+      ctx.font = '600 9.5px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#64748b'; ctx.textAlign = 'right';
+      [0, 3, 4, 8, 9].forEach(g => ctx.fillText(`${g}G`, 22, yG(g) + 3));
+
+      ctx.textAlign = 'center';
+      rRect(144, yG(3), 94, 3 * pxPerGb, 5, k === 'low_ram' ? '#0c4a6e' : '#0f172a', '#38bdf8', k === 'low_ram' ? 2 : 1.2);
+      if (state.reclaim) {
+        rRect(144, yG(4), 94, pxPerGb, 3, k === 'remap' ? '#065f46' : '#052e16', '#34d399', k === 'remap' ? 2 : 1.4);
+      } else {
+        rRect(144, yG(4), 94, pxPerGb, 3, '#4c0519', '#f43f5e', 1.6);
+      }
+      rRect(144, yG(8), 94, 4 * pxPerGb, 5, k === 'high_ram' ? '#083344' : '#0f172a', '#22d3ee', k === 'high_ram' ? 2 : 1.2);
+
+      ctx.font = '600 10px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#7dd3fc'; ctx.fillText('0~3G', 191, yG(1.5) + 4);
+      ctx.fillStyle = state.reclaim ? '#6ee7b7' : '#fda4af';
+      ctx.fillText(state.reclaim ? '3~4G 已回收' : '3~4G 浪费!', 191, yG(3.5) + 4);
+      ctx.fillStyle = '#67e8f9'; ctx.fillText('4~8G', 191, yG(6) + 4);
+
+      if (k === 'high_ram') {
+        linePath([{x:124,y:yG(5)},{x:144,y:yG(5)}], '#22d3ee', 2, [3,2], '#22d3ee');
+      } else if (k === 'low_ram') {
+        linePath([{x:124,y:yG(1.5)},{x:144,y:yG(1.5)}], '#38bdf8', 2, [3,2], '#38bdf8');
+      }
+      if (state.reclaim) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(124, yG(8.5));
+        ctx.bezierCurveTo(139, yG(8.5), 129, yG(3.5), 144, yG(3.5));
+        ctx.strokeStyle = k === 'remap' ? '#34d399' : 'rgba(52,211,153,0.45)';
+        ctx.lineWidth = k === 'remap' ? 2.2 : 1.3;
+        ctx.setLineDash([4, 3]);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      const paGb = Math.min(9, Number(state.pa) / (1024 * 1024 * 1024));
+      ctx.save();
+      ctx.shadowColor = state.info.color;
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = state.info.color;
+      ctx.beginPath(); ctx.arc(124, yG(paGb), 4.5, 0, Math.PI * 2); ctx.fill();
+      if (state.info.dramAddr !== null) {
+        const dGb = Number(state.info.dramAddr) / (1024 * 1024 * 1024);
+        ctx.beginPath(); ctx.arc(144, yG(dGb), 4.5, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawDatapath() {
+      const info = state.info;
+
+      linePath([{x:346,y:196},{x:604,y:196}], '#1e293b', 4);
+      linePath([{x:470,y:196},{x:470,y:118},{x:586,y:118},{x:586,y:196}], '#1e293b', 2.5, [5,4]);
+
+      linePath([{x:772,y:146},{x:818,y:146},{x:818,y:66},{x:866,y:66}], '#1e293b', 4);
+      linePath([{x:772,y:174},{x:832,y:174},{x:832,y:152},{x:866,y:152}], '#1e293b', 4);
+      linePath([{x:772,y:256},{x:832,y:256},{x:832,y:354},{x:866,y:354}], '#1e293b', 4);
+      linePath([{x:832,y:308},{x:866,y:308}], '#1e293b', 4);
+      linePath([{x:832,y:262},{x:866,y:262}], '#1e293b', 4);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '600 9.5px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('UC 旁路 (仅绕过 Cache)', 528, 108);
+
+      if (state.anim && info) {
+        linePath(state.anim.pts, info.color, 3, null, info.color);
+      }
+
+      // 1. CPU
+      rRect(274, 156, 72, 80, 11, '#0f172a', '#38bdf8', 1.8, 'rgba(56,189,248,0.28)');
+      ctx.fillStyle = '#f8fafc'; ctx.font = '700 12px Inter, sans-serif';
+      ctx.fillText('CPU', 310, 186);
+      ctx.fillStyle = '#94a3b8'; ctx.font = '600 9.5px "JetBrains Mono", monospace';
+      ctx.fillText('发出 VA', 310, 212);
+
+      // 2. MMU
+      rRect(372, 156, 80, 80, 11, '#0f172a', '#38bdf8', 1.8, 'rgba(56,189,248,0.28)');
+      ctx.fillStyle = '#f8fafc'; ctx.font = '700 11.5px Inter, sans-serif';
+      ctx.fillText('MMU', 412, 178);
+      ctx.fillStyle = '#94a3b8'; ctx.font = '600 9px "JetBrains Mono", monospace';
+      ctx.fillText('内存管理/页表', 412, 197);
+      ctx.fillStyle = info.color; ctx.font = '700 9.5px "JetBrains Mono", monospace';
+      ctx.fillText(info.mmuText, 412, 218);
+
+      // 3. Cache
+      const bypassed = info.bypassCache;
+      rRect(488, 156, 80, 80, 11, '#0f172a', bypassed ? '#334155' : '#22d3ee', 1.6, bypassed ? null : 'rgba(34,211,238,0.25)');
+      ctx.fillStyle = bypassed ? '#475569' : '#f8fafc'; ctx.font = '700 11.5px Inter, sans-serif';
+      ctx.fillText('Cache', 528, 178);
+      ctx.fillStyle = bypassed ? '#475569' : '#94a3b8'; ctx.font = '600 9px "JetBrains Mono", monospace';
+      ctx.fillText('高速缓存', 528, 197);
+      ctx.fillStyle = bypassed ? '#fb7185' : '#34d399'; ctx.font = '700 9.5px "JetBrains Mono", monospace';
+      ctx.fillText(bypassed ? 'UC 绕过' : 'WB 查缓存', 528, 218);
+
+      // 4. Host Bridge
+      rRect(604, 114, 168, 178, 14, '#0b132b', info.color, 2, info.color + '44');
+      ctx.fillStyle = '#ffffff'; ctx.font = '800 12px Inter, sans-serif';
+      ctx.fillText('主机桥 (Host Bridge)', 688, 138);
+
+      rRect(616, 150, 144, 46, 8, '#020617', '#334155', 1.2);
+      ctx.fillStyle = '#64748b'; ctx.font = '600 9px "JetBrains Mono", monospace';
+      ctx.fillText('区间译码器 (Decoder)', 688, 166);
+      ctx.fillStyle = info.color; ctx.font = '700 10.5px "JetBrains Mono", monospace';
+      const cmpShort = info.kind === 'low_ram' ? 'PA < TOLUD (3G)' :
+                       info.kind === 'high_ram' ? '4.0G ≤ PA < 8.0G' :
+                       info.kind === 'rom' ? 'FFE0_0000h ~ 4G' :
+                       info.kind === 'mmio' ? 'TOLUD ≤ PA < 4G' :
+                       info.kind === 'remap' ? '8.0G ≤ PA < 9.0G' : '超出有效区间';
+      ctx.fillText(cmpShort, 688, 185);
+
+      const subActive = info.useSub;
+      rRect(616, 210, 144, 68, 8, subActive ? '#064e3b' : '#020617', subActive ? '#34d399' : '#334155', subActive ? 1.8 : 1.2, subActive ? '#34d399' : null);
+      ctx.fillStyle = subActive ? '#6ee7b7' : '#64748b'; ctx.font = '600 9px "JetBrains Mono", monospace';
+      ctx.fillText('重映射减法器 (Sub)', 688, 228);
+      ctx.fillStyle = subActive ? '#ffffff' : '#475569'; ctx.font = '700 11px "JetBrains Mono", monospace';
+      ctx.fillText(subActive ? '(PA - 8G) + 3G' : '直通 (MUX=0)', 688, 248);
+      ctx.fillStyle = subActive ? '#a7f3d0' : '#334155'; ctx.font = '600 10px "JetBrains Mono", monospace';
+      ctx.fillText(subActive ? `→ ${fmtGb(info.dramAddr)}` : '无偏移加减', 688, 266);
+
+      // IMC_EN 指示芯片
+      const imcOn = info.imcOpen;
+      rRect(780, 242, 42, 28, 6, imcOn ? '#064e3b' : '#4c0519', imcOn ? '#34d399' : '#f43f5e', 1.6, imcOn ? '#34d399' : '#f43f5e');
+      ctx.fillStyle = '#ffffff'; ctx.font = '700 9.5px "JetBrains Mono", monospace';
+      ctx.fillText(imcOn ? '主存开' : '主存关', 801, 260);
+
+      // 右侧 3 个物理器件
+      const isPcie = info.dst === 'pcie';
+      rRect(866, 30, 194, 72, 12, isPcie ? '#2e1065' : '#0f172a', isPcie ? '#a78bfa' : '#334155', isPcie ? 2.2 : 1.4, isPcie ? '#a78bfa' : null);
+      ctx.fillStyle = '#ede9fe'; ctx.font = '700 12px Inter, sans-serif';
+      ctx.fillText('PCIe 外设 (BAR 基址)', 963, 58);
+      ctx.fillStyle = '#a78bfa'; ctx.font = '600 10px "JetBrains Mono", monospace';
+      ctx.fillText('偏移 = PA - BAR 基址', 963, 80);
+
+      const isRom = info.dst === 'rom';
+      rRect(866, 116, 194, 72, 12, isRom ? '#451a03' : '#0f172a', isRom ? '#fbbf24' : '#334155', isRom ? 2.2 : 1.4, isRom ? '#fbbf24' : null);
+      ctx.fillStyle = '#fef3c7'; ctx.font = '700 12px Inter, sans-serif';
+      ctx.fillText('南桥(PCH) → BIOS ROM', 963, 144);
+      ctx.fillStyle = '#fbbf24'; ctx.font = '600 10px "JetBrains Mono", monospace';
+      ctx.fillText('2MB 只读 · DMI 总线', 963, 166);
+
+      const isDram = info.dst.startsWith('dram');
+      rRect(866, 202, 194, 182, 12, '#0f172a', isDram ? info.color : '#334155', isDram ? 2 : 1.4, isDram ? info.color + '44' : null);
+      ctx.fillStyle = '#e2e8f0'; ctx.font = '700 11.5px Inter, sans-serif';
+      ctx.fillText('内存控制器(IMC) → DDR', 963, 224);
+
+      const hitH = info.dst === 'dram_high';
+      rRect(878, 240, 170, 40, 7, hitH ? '#083344' : '#020617', hitH ? '#22d3ee' : '#1e293b', hitH ? 2 : 1.2, hitH ? '#22d3ee' : null);
+      ctx.fillStyle = hitH ? '#67e8f9' : '#64748b'; ctx.font = '700 10.5px "JetBrains Mono", monospace';
+      ctx.fillText('DRAM 4~8G (高端直通)', 963, 264);
+
+      const hitR = info.dst === 'dram_reclaim';
+      rRect(878, 288, 170, 40, 7, hitR ? '#064e3b' : (state.reclaim ? '#052e16' : '#4c0519'), hitR ? '#34d399' : (state.reclaim ? '#065f46' : '#e11d48'), hitR ? 2 : 1.2, hitR ? '#34d399' : null);
+      ctx.fillStyle = hitR ? '#6ee7b7' : (state.reclaim ? '#10b981' : '#fda4af'); ctx.font = '700 10.5px "JetBrains Mono", monospace';
+      ctx.fillText(state.reclaim ? 'DRAM 3~4G (重映射回收)' : 'DRAM 3~4G (被遮蔽浪费)', 963, 312);
+
+      const hitL = info.dst === 'dram_low';
+      rRect(878, 336, 170, 38, 7, hitL ? '#0c4a6e' : '#020617', hitL ? '#38bdf8' : '#1e293b', hitL ? 2 : 1.2, hitL ? '#38bdf8' : null);
+      ctx.fillStyle = hitL ? '#7dd3fc' : '#64748b'; ctx.font = '700 10.5px "JetBrains Mono", monospace';
+      ctx.fillText('DRAM 0~3G (低端直通)', 963, 359);
+    }
+
+    function tick() {
+      const sx = canvas.width / W;
+      const sy = canvas.height / H;
+      ctx.save();
+      ctx.setTransform(sx, 0, 0, sy, 0, 0);
+
+      drawBackgroundGrid();
+      drawLeftMemoryMap();
+      drawDatapath();
+
+      const a = state.anim;
+      if (a && a.pts.length >= 2) {
+        if (!state.paused && !a.done) {
+          const p0 = a.pts[a.seg];
+          const p1 = a.pts[a.seg + 1];
+          const dist = Math.hypot(p1.x - p0.x, p1.y - p0.y) || 1;
+          a.t += 4.8 / dist;
+          if (a.t >= 1) {
+            a.t = 0;
+            a.seg += 1;
+            if (p1.transform && !a.transformed) {
+              a.transformed = true;
+              a.label = fmtGb(state.info.dramAddr);
+            }
+            if (a.seg >= a.pts.length - 1) {
+              a.done = true;
+              stageStatus.textContent = '已送达 (DONE)';
+              stageStatus.className = 'font-mono text-[11px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold';
+            }
+          }
+        }
+
+        const idx = Math.min(a.seg, a.pts.length - 2);
+        const p0 = a.pts[idx], p1 = a.pts[idx + 1];
+        const t = a.done ? 1 : a.t;
+        const px = p0.x + (p1.x - p0.x) * t;
+        const py = p0.y + (p1.y - p0.y) * t;
+
+        const c = state.info.color;
+        rRect(px - 36, py - 12, 72, 24, 12, c, '#ffffff', 1.8, c);
+        ctx.fillStyle = '#020617';
+        ctx.font = '800 10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(a.label, px, py + 4);
+      }
+
+      ctx.restore();
+      requestAnimationFrame(tick);
+    }
+
+    function resize() {
+      const rect = canvas.parentElement.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+    }
+
+    canvas.addEventListener('click', e => {
+      const rect = canvas.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * W;
+      const y = ((e.clientY - rect.top) / rect.height) * H;
+      if (x >= 26 && x <= 124) {
+        const g = (378 - y) / 36;
+        if (g >= 8 && g <= 9) { state.pa = 0x210000004n; startTrace(); }
+        else if (g >= 4 && g < 8) { state.pa = 0x140000008n; startTrace(); }
+        else if (g >= 3.72 && g < 4) { state.pa = 0xFFFFFFF0n; startTrace(); }
+        else if (g >= 3 && g < 3.72) { state.pa = 0xD0000010n; startTrace(); }
+        else if (g >= 0 && g < 3) { state.pa = 0x60000007n; startTrace(); }
+      }
+    });
+
+    document.getElementById('case-low').addEventListener('click', () => { state.pa = 0x60000007n; startTrace(); });
+    document.getElementById('case-mmio').addEventListener('click', () => { state.pa = 0xD0000010n; startTrace(); });
+    document.getElementById('case-rom').addEventListener('click', () => { state.pa = 0xFFFFFFF0n; startTrace(); });
+    document.getElementById('case-high').addEventListener('click', () => { state.pa = 0x140000008n; startTrace(); });
+    document.getElementById('case-remap').addEventListener('click', () => { state.pa = 0x210000004n; startTrace(); });
+
+    btnReclaimOn.addEventListener('click', () => { state.reclaim = true; startTrace(); });
+    btnReclaimOff.addEventListener('click', () => { state.reclaim = false; startTrace(); });
+    btnIlNone.addEventListener('click', () => { state.interleave = 'none'; startTrace(); });
+    btnIlLow.addEventListener('click', () => { state.interleave = 'low'; startTrace(); });
+    btnIlHigh.addEventListener('click', () => { state.interleave = 'high'; startTrace(); });
+
+    function parseInput() {
+      const raw = paInput.value.trim().replace(/_/g, '').replace(/H$/i, '').replace(/^0x/i, '');
+      try {
+        if (/^[0-9a-fA-F]+$/.test(raw)) {
+          const v = BigInt('0x' + raw);
+          if (v >= 0n && v <= 0x250000000n) state.pa = v;
+        }
+      } catch (_) {}
+      startTrace();
+    }
+    btnRun.addEventListener('click', parseInput);
+    paInput.addEventListener('keydown', e => { if (e.key === 'Enter') parseInput(); });
+
+    btnReplay.addEventListener('click', () => startTrace());
+    btnPause.addEventListener('click', () => {
+      state.paused = !state.paused;
+      btnPause.textContent = state.paused ? '继续信号' : '暂停讲解';
+    });
+
+    window.addEventListener('resize', resize);
+    window.onload = () => {
+      resize();
+      startTrace();
+      tick();
+    };
+  </script>
+</body>
+</html>
